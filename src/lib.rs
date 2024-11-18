@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -43,6 +44,9 @@ struct Args {
 
     #[arg(short('s'), long("secrets"))]
     master_secrets: String,
+
+    #[arg(long("fxa-uid"))]
+    fxa_uids: Vec<String>,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -54,6 +58,7 @@ pub async fn run() -> anyhow::Result<()> {
         uri: Uri::from_str(&args.uri)?,
         client: Client::builder(TokioExecutor::new()).build_http(),
         secrets: Secrets::new(&args.master_secrets).map_err(|err| anyhow::anyhow!("{err}"))?,
+        allowed_user_ids: args.fxa_uids.into_iter().collect(),
     };
 
     let router = Router::new().fallback(handle).with_state(handler);
@@ -64,20 +69,6 @@ pub async fn run() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
-
-    /*select! {
-        _ = signal_stop().fuse() => {
-            info!("stop syncstorage proxy");
-
-            Ok(())
-        }
-
-        res = axum::serve(listener, router).into_future().fuse() => {
-            res?;
-
-            Err(anyhow::anyhow!("server stopped unexpected"))
-        }
-    }*/
 }
 
 async fn handle(State(mut handler): State<Handler>, headers: HeaderMap, req: Request) -> Response {
@@ -92,16 +83,45 @@ struct Handler {
     uri: Uri,
     client: Client<HttpConnector, Body>,
     secrets: Secrets,
+    allowed_user_ids: HashSet<String>,
 }
 
 impl Handler {
-    #[instrument(err)]
+    #[instrument(level = "debug", err)]
     async fn handle(&mut self, req: Request, headers: HeaderMap) -> anyhow::Result<Response> {
         let (mut parts, body) = req.into_parts();
 
         debug!(?parts, "get parts");
 
-        self.auth(&parts.uri, &headers);
+        if !self.is_whitelist_path(&parts.uri) {
+            match self.get_user_id(&parts.uri, &headers) {
+                Err(status_code) => {
+                    let mut resp = Response::new(Body::empty());
+                    *resp.status_mut() = status_code;
+
+                    return Ok(resp);
+                }
+
+                Ok(user_id) => {
+                    if !self.allowed_user_ids.contains(&user_id.fxa_uid) {
+                        let mut resp = Response::new(Body::empty());
+                        *resp.status_mut() = StatusCode::FORBIDDEN;
+
+                        return Ok(resp);
+                    }
+
+                    // our token server is started by sycnstorage-rs
+                    if user_id.tokenserver_origin != TokenserverOrigin::Rust {
+                        let mut resp = Response::new(Body::empty());
+                        *resp.status_mut() = StatusCode::FORBIDDEN;
+
+                        return Ok(resp);
+                    }
+
+                    debug!(?user_id, "authorized user");
+                }
+            }
+        }
 
         let body = body
             .into_data_stream()
@@ -139,19 +159,19 @@ impl Handler {
         ))
     }
 
-    #[instrument]
-    fn auth(&mut self, uri: &Uri, header: &HeaderMap) {
+    #[instrument(level = "debug", err, ret)]
+    fn get_user_id(&mut self, uri: &Uri, header: &HeaderMap) -> Result<HawkIdentifier, StatusCode> {
         let auth = match header.get("authorization") {
             None => {
                 error!("miss auth header");
 
-                return;
+                return Err(StatusCode::UNAUTHORIZED);
             }
             Some(auth) => match auth.to_str() {
                 Err(err) => {
                     error!(%err, "convert auth value to str failed");
 
-                    return;
+                    return Err(StatusCode::UNAUTHORIZED);
                 }
 
                 Ok(auth) => auth,
@@ -161,7 +181,7 @@ impl Handler {
         if auth.len() < 5 || &auth[0..5] != "Hawk " {
             error!(auth, "unknown auth value");
 
-            return;
+            return Err(StatusCode::UNAUTHORIZED);
         }
 
         debug!(auth, "get auth value done");
@@ -170,7 +190,7 @@ impl Handler {
             Err(err) => {
                 error!(%err, "parse hawk header failed");
 
-                return;
+                return Err(StatusCode::UNAUTHORIZED);
             }
 
             Ok(auth) => auth,
@@ -182,7 +202,7 @@ impl Handler {
             None => {
                 error!("miss auth id");
 
-                return;
+                return Err(StatusCode::UNAUTHORIZED);
             }
 
             Some(id) => id,
@@ -201,7 +221,7 @@ impl Handler {
             Err(err) => {
                 error!(%err, "extracting hawk payload failed");
 
-                return;
+                return Err(StatusCode::UNAUTHORIZED);
             }
 
             Ok(payload) => payload,
@@ -211,7 +231,7 @@ impl Handler {
             Err(err) => {
                 error!(%err, "uid from path failed");
 
-                return;
+                return Err(StatusCode::UNAUTHORIZED);
             }
 
             Ok(puid) => puid,
@@ -220,7 +240,7 @@ impl Handler {
         if payload.user_id != puid {
             error!("⚠️ Hawk UID not in URI: {:?} {:?}", payload.user_id, uri);
 
-            return;
+            return Err(StatusCode::UNAUTHORIZED);
         }
 
         let user_id = HawkIdentifier {
@@ -232,8 +252,11 @@ impl Handler {
             tokenserver_origin: payload.tokenserver_origin,
         };
 
-        // Ok(user_id)
-        debug!(?user_id, "get user id done");
+        Ok(user_id)
+    }
+
+    fn is_whitelist_path(&self, uri: &Uri) -> bool {
+        uri.path() == "/__heartbeat__"
     }
 
     fn uid_from_path(uri: &Uri) -> anyhow::Result<u64> {

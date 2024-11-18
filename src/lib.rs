@@ -94,7 +94,7 @@ impl Handler {
         debug!(?parts, "get parts");
 
         if !self.is_whitelist_path(&parts.uri) {
-            match self.get_user_id(&parts.uri, &headers) {
+            let auth = match self.get_auth_header(&headers) {
                 Err(status_code) => {
                     let mut resp = Response::new(Body::empty());
                     *resp.status_mut() = status_code;
@@ -102,24 +102,39 @@ impl Handler {
                     return Ok(resp);
                 }
 
-                Ok(user_id) => {
-                    if !self.allowed_user_ids.contains(&user_id.fxa_uid) {
+                Ok(auth) => auth,
+            };
+
+            if !self.is_token_server_request(auth) {
+                match self.get_user_id(&parts.uri, auth) {
+                    Err(status_code) => {
                         let mut resp = Response::new(Body::empty());
-                        *resp.status_mut() = StatusCode::FORBIDDEN;
+                        *resp.status_mut() = status_code;
 
                         return Ok(resp);
                     }
 
-                    // our token server is started by sycnstorage-rs
-                    if user_id.tokenserver_origin != TokenserverOrigin::Rust {
-                        let mut resp = Response::new(Body::empty());
-                        *resp.status_mut() = StatusCode::FORBIDDEN;
+                    Ok(user_id) => {
+                        if !self.allowed_user_ids.contains(&user_id.fxa_uid) {
+                            let mut resp = Response::new(Body::empty());
+                            *resp.status_mut() = StatusCode::FORBIDDEN;
 
-                        return Ok(resp);
+                            return Ok(resp);
+                        }
+
+                        // our token server is started by sycnstorage-rs
+                        if user_id.tokenserver_origin != TokenserverOrigin::Rust {
+                            let mut resp = Response::new(Body::empty());
+                            *resp.status_mut() = StatusCode::FORBIDDEN;
+
+                            return Ok(resp);
+                        }
+
+                        debug!(?user_id, "authorized user");
                     }
-
-                    debug!(?user_id, "authorized user");
                 }
+            } else {
+                debug!(auth, "release bearer request for now")
             }
         }
 
@@ -160,8 +175,8 @@ impl Handler {
     }
 
     #[instrument(level = "debug", err, ret)]
-    fn get_user_id(&mut self, uri: &Uri, header: &HeaderMap) -> Result<HawkIdentifier, StatusCode> {
-        let auth = match header.get("authorization") {
+    fn get_auth_header<'a>(&self, headers: &'a HeaderMap) -> Result<&'a str, StatusCode> {
+        let auth = match headers.get("authorization") {
             None => {
                 error!("miss auth header");
 
@@ -178,6 +193,11 @@ impl Handler {
             },
         };
 
+        Ok(auth)
+    }
+
+    #[instrument(level = "debug", err, ret)]
+    fn get_user_id(&mut self, uri: &Uri, auth: &str) -> Result<HawkIdentifier, StatusCode> {
         if auth.len() < 5 || &auth[0..5] != "Hawk " {
             error!(auth, "unknown auth value");
 
@@ -257,6 +277,12 @@ impl Handler {
 
     fn is_whitelist_path(&self, uri: &Uri) -> bool {
         uri.path() == "/__heartbeat__"
+    }
+
+    fn is_token_server_request(&self, auth: &str) -> bool {
+        auth.split_once(' ')
+            .map(|(auth_type, _)| auth_type.eq_ignore_ascii_case("bearer"))
+            .unwrap_or(false)
     }
 
     fn uid_from_path(uri: &Uri) -> anyhow::Result<u64> {

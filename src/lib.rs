@@ -1,28 +1,28 @@
-#![feature(impl_trait_in_assoc_type)]
-
-use std::convert::Infallible;
-use std::error::Error;
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::task::{Context, Poll};
+use std::time::SystemTime;
 
 use axum::body::Body;
-use axum::extract::Request;
-use axum::http::{StatusCode, Uri};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use axum::Router;
+use base64::engine::general_purpose::URL_SAFE;
+use base64::Engine;
 use bytes::BytesMut;
 use clap::Parser;
 use futures_util::TryStreamExt;
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use tower::Service;
-use tracing::debug;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tracing::level_filters::LevelFilter;
+use tracing::{debug, error, instrument};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -38,6 +38,9 @@ struct Args {
 
     #[arg(short, long)]
     debug: bool,
+
+    #[arg(short('s'), long("secrets"))]
+    master_secrets: String,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -45,10 +48,13 @@ pub async fn run() -> anyhow::Result<()> {
 
     init_log(args.debug);
 
-    let router = Router::new().fallback_service(Handler {
+    let handler = Handler {
         uri: Uri::from_str(&args.uri)?,
         client: Client::builder(TokioExecutor::new()).build_http(),
-    });
+        secrets: Secrets::new(&args.master_secrets).map_err(|err| anyhow::anyhow!("{err}"))?,
+    };
+
+    let router = Router::new().fallback(handle).with_state(handler);
 
     let listener = tokio::net::TcpListener::bind(args.listen_addr).await?;
     axum::serve(listener, router).await?;
@@ -56,100 +62,341 @@ pub async fn run() -> anyhow::Result<()> {
     panic!("stopped")
 }
 
+async fn handle(State(mut handler): State<Handler>, headers: HeaderMap, req: Request) -> Response {
+    handler
+        .handle(req, headers)
+        .await
+        .unwrap_or_else(create_err_resp)
+}
+
 #[derive(Debug, Clone)]
 struct Handler {
     uri: Uri,
     client: Client<HttpConnector, Body>,
+    secrets: Secrets,
 }
 
-impl Service<Request> for Handler {
-    type Response = Response;
-    type Error = Infallible;
-    type Future = impl Future<Output = Result<Self::Response, Self::Error>> + Send + 'static;
+impl Handler {
+    #[instrument(err)]
+    async fn handle(&mut self, req: Request, headers: HeaderMap) -> anyhow::Result<Response> {
+        let (mut parts, body) = req.into_parts();
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+        debug!(?parts, "get parts");
+
+        self.auth(&parts.uri, &headers);
+
+        let body = body
+            .into_data_stream()
+            .try_fold(BytesMut::new(), |mut buf, data| async move {
+                buf.extend(data);
+
+                Ok::<_, axum::Error>(buf)
+            })
+            .await?;
+
+        debug!(body = %String::from_utf8_lossy(&body), "get body");
+
+        let mut uri_parts = self.uri.clone().into_parts();
+        uri_parts.path_and_query = parts.uri.path_and_query().cloned();
+
+        parts.uri = Uri::from_parts(uri_parts)?;
+        let request = Request::from_parts(parts, Body::new(Full::new(body.freeze())));
+        let resp = self.client.request(request).await?;
+
+        let (parts, body) = resp.into_parts();
+        let body = body
+            .into_data_stream()
+            .try_fold(BytesMut::new(), |mut buf, data| async move {
+                buf.extend(data);
+
+                Ok::<_, hyper::Error>(buf)
+            })
+            .await?;
+
+        debug!(body = %String::from_utf8_lossy(&body), "get response body");
+
+        Ok(Response::from_parts(
+            parts,
+            Body::new(Full::new(body.freeze())),
+        ))
     }
 
-    fn call(&mut self, req: Request) -> Self::Future {
-        let client = self.client.clone();
-        let uri = self.uri.clone();
+    #[instrument]
+    fn auth(&mut self, uri: &Uri, header: &HeaderMap) {
+        let auth = match header.get("authorization") {
+            None => {
+                error!("miss auth header");
 
-        async move {
-            let (mut parts, body) = req.into_parts();
-
-            debug!(?parts, "get parts");
-
-            let body = match body
-                .into_data_stream()
-                .try_fold(BytesMut::new(), |mut buf, data| async move {
-                    buf.extend(data);
-
-                    Ok::<_, axum::Error>(buf)
-                })
-                .await
-            {
+                return;
+            }
+            Some(auth) => match auth.to_str() {
                 Err(err) => {
-                    return Ok(create_err_resp(err));
+                    error!(%err, "convert auth value to str failed");
+
+                    return;
                 }
 
-                Ok(body) => body,
-            };
+                Ok(auth) => auth,
+            },
+        };
 
-            debug!(body = %String::from_utf8_lossy(&body), "get body");
+        if auth.len() < 5 || &auth[0..5] != "Hawk " {
+            error!(auth, "unknown auth value");
 
-            let mut uri_parts = uri.into_parts();
-            uri_parts.path_and_query = parts.uri.path_and_query().cloned();
+            return;
+        }
 
-            match Uri::from_parts(uri_parts) {
-                Err(err) => {
-                    return Ok(create_err_resp(err));
-                }
+        debug!(auth, "get auth value done");
 
-                Ok(uri) => {
-                    parts.uri = uri;
-                }
+        let auth = match auth[5..].parse::<hawk::Header>() {
+            Err(err) => {
+                error!(%err, "parse hawk header failed");
+
+                return;
             }
 
-            let request = Request::from_parts(parts, Body::new(Full::new(body.freeze())));
-            match client.request(request).await {
-                Err(err) => Ok(Response::new(Body::from(err.to_string()))),
+            Ok(auth) => auth,
+        };
 
-                Ok(resp) => {
-                    let (parts, body) = resp.into_parts();
-                    let body = match body
-                        .into_data_stream()
-                        .try_fold(BytesMut::new(), |mut buf, data| async move {
-                            buf.extend(data);
+        debug!(?auth, "get hawk auth done");
 
-                            Ok::<_, hyper::Error>(buf)
-                        })
-                        .await
-                    {
-                        Err(err) => {
-                            return Ok(create_err_resp(err));
-                        }
+        let id = match &auth.id {
+            None => {
+                error!("miss auth id");
 
-                        Ok(body) => body,
-                    };
+                return;
+            }
 
-                    debug!(body = %String::from_utf8_lossy(&body), "get response body");
+            Some(id) => id,
+        };
 
-                    Ok(Response::from_parts(
-                        parts,
-                        Body::new(Full::new(body.freeze())),
+        let expiry = if uri.path().ends_with("/info/collections") {
+            0
+        } else {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+
+        let payload = match HawkPayload::extract_and_validate(id, &self.secrets, expiry) {
+            Err(err) => {
+                error!(%err, "extracting hawk payload failed");
+
+                return;
+            }
+
+            Ok(payload) => payload,
+        };
+
+        let puid = match Self::uid_from_path(uri) {
+            Err(err) => {
+                error!(%err, "uid from path failed");
+
+                return;
+            }
+
+            Ok(puid) => puid,
+        };
+
+        if payload.user_id != puid {
+            error!("⚠️ Hawk UID not in URI: {:?} {:?}", payload.user_id, uri);
+
+            return;
+        }
+
+        let user_id = HawkIdentifier {
+            legacy_id: payload.user_id,
+            fxa_uid: payload.fxa_uid,
+            fxa_kid: payload.fxa_kid,
+            hashed_fxa_uid: payload.hashed_fxa_uid,
+            hashed_device_id: payload.hashed_device_id,
+            tokenserver_origin: payload.tokenserver_origin,
+        };
+
+        // Ok(user_id)
+        debug!(?user_id, "get user id done");
+    }
+
+    fn uid_from_path(uri: &Uri) -> anyhow::Result<u64> {
+        // TODO: replace with proper path parser.
+        // path: "/1.5/{uid}"
+        let elements: Vec<&str> = uri.path().split('/').collect();
+        if let Some(v) = elements.get(2) {
+            let clean = match Self::urldecode(v) {
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "⚠️ HawkIdentifier Error invalid UID {:?} {:?}",
+                        v,
+                        e
                     ))
                 }
-            }
+                Ok(v) => v,
+            };
+
+            u64::from_str(&clean)
+                .map_err(|e| anyhow::anyhow!("⚠️ HawkIdentifier Error invalid UID {:?} {:?}", v, e))
+        } else {
+            Err(anyhow::anyhow!(
+                "⚠️ HawkIdentifier Error missing UID {:?}",
+                uri
+            ))
         }
+    }
+
+    fn urldecode(s: &str) -> anyhow::Result<String> {
+        let decoded = urlencoding::decode(s)
+            .inspect_err(|err| {
+                error!("Extract: unclean urldecode entry: {:?} {:?}", s, err);
+            })?
+            .into_owned();
+
+        Ok(decoded)
     }
 }
 
-fn create_err_resp<E: Error>(err: E) -> Response {
+fn create_err_resp(err: anyhow::Error) -> Response {
     let mut resp = Response::new(Body::from(err.to_string()));
     *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
 
     resp
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct HawkIdentifier {
+    /// For MySQL database backends as the primary key
+    pub legacy_id: u64,
+    /// For NoSQL database backends that require randomly distributed primary keys
+    pub fxa_uid: String,
+    pub fxa_kid: String,
+    pub hashed_fxa_uid: String,
+    pub hashed_device_id: String,
+    pub tokenserver_origin: TokenserverOrigin,
+}
+
+/// A parsed and authenticated JSON payload
+/// extracted from the signed `id` property
+/// of a Hawk `Authorization` header.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct HawkPayload {
+    /// Expiry time for the payload, in seconds.
+    pub expires: f64,
+
+    /// Base URI for the storage node.
+    pub node: String,
+
+    /// Salt used during HKDF-expansion of the token secret.
+    pub salt: String,
+
+    /// User identifier.
+    #[serde(rename = "uid")]
+    pub user_id: u64,
+
+    #[serde(default)]
+    pub fxa_uid: String,
+
+    #[serde(default)]
+    pub fxa_kid: String,
+
+    #[serde(default)]
+    pub hashed_fxa_uid: String,
+
+    #[serde(default)]
+    pub hashed_device_id: String,
+
+    /// The Tokenserver that created this token.
+    #[serde(default)]
+    pub tokenserver_origin: TokenserverOrigin,
+}
+
+impl HawkPayload {
+    /// Decode the `id` property of a Hawk header
+    /// and verify the payload part against the signature part.
+    fn extract_and_validate(
+        id: &str,
+        secrets: &Secrets,
+        expiry: u64,
+    ) -> anyhow::Result<HawkPayload> {
+        let decoded_id = URL_SAFE.decode(id)?;
+        if decoded_id.len() <= 32 {
+            return Err(anyhow::anyhow!("not enough length"));
+        }
+
+        let payload_length = decoded_id.len() - 32;
+        let payload = &decoded_id[0..payload_length];
+        let signature = &decoded_id[payload_length..];
+
+        Self::verify_hmac(payload, &secrets.signing_secret, signature)?;
+
+        let payload: HawkPayload = serde_json::from_slice(payload)?;
+
+        if expiry == 0 || (payload.expires.round() as u64) > expiry {
+            Ok(payload)
+        } else {
+            Err(anyhow::anyhow!("expired"))
+        }
+    }
+
+    /// Helper function for [HMAC](https://tools.ietf.org/html/rfc2104) verification.
+    fn verify_hmac(info: &[u8], key: &[u8], expected: &[u8]) -> anyhow::Result<()> {
+        let mut hmac = Hmac::<Sha256>::new_from_slice(key)?;
+        hmac.update(info);
+        hmac.verify(expected.into()).map_err(From::from)
+    }
+}
+
+/// Secrets used during Hawk authentication.
+#[derive(Clone, Debug)]
+pub struct Secrets {
+    /// The master secret in byte array form.
+    ///
+    /// The signing secret and token secret are derived from this.
+    pub master_secret: Vec<u8>,
+
+    /// The signing secret used during Hawk authentication.
+    pub signing_secret: [u8; 32],
+}
+
+impl Secrets {
+    /// Decode the master secret to a byte array
+    /// and derive the signing secret from it.
+    pub fn new(master_secret: &str) -> Result<Self, String> {
+        let master_secret = master_secret.as_bytes().to_vec();
+        let signing_secret = Self::hkdf_expand_32(
+            b"services.mozilla.com/tokenlib/v1/signing",
+            None,
+            &master_secret,
+        )?;
+
+        Ok(Self {
+            master_secret,
+            signing_secret,
+        })
+    }
+
+    /// Helper function for [HKDF](https://tools.ietf.org/html/rfc5869) expansion to 32 bytes.
+    pub fn hkdf_expand_32(
+        info: &[u8],
+        salt: Option<&[u8]>,
+        key: &[u8],
+    ) -> Result<[u8; 32], String> {
+        let mut result = [0u8; 32];
+        let hkdf = Hkdf::<Sha256>::new(salt, key);
+        hkdf.expand(info, &mut result)
+            .map_err(|e| format!("HKDF Error: {:?}", e))?;
+
+        Ok(result)
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenserverOrigin {
+    /// The Python Tokenserver.
+    #[default]
+    Python,
+    /// The Rust Tokenserver.
+    Rust,
 }
 
 fn init_log(debug: bool) {

@@ -12,7 +12,7 @@ use base64::engine::general_purpose::URL_SAFE;
 use base64::Engine;
 use bytes::BytesMut;
 use clap::Parser;
-use futures_util::TryStreamExt;
+use futures_util::{select, FutureExt, TryStreamExt};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use http_body_util::{BodyExt, Full};
@@ -21,8 +21,10 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tokio::signal::unix;
+use tokio::signal::unix::SignalKind;
 use tracing::level_filters::LevelFilter;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, info, instrument};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -55,11 +57,27 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let router = Router::new().fallback(handle).with_state(handler);
-
     let listener = tokio::net::TcpListener::bind(args.listen_addr).await?;
-    axum::serve(listener, router).await?;
 
-    panic!("stopped")
+    axum::serve(listener, router)
+        .with_graceful_shutdown(signal_stop())
+        .await?;
+
+    Ok(())
+
+    /*select! {
+        _ = signal_stop().fuse() => {
+            info!("stop syncstorage proxy");
+
+            Ok(())
+        }
+
+        res = axum::serve(listener, router).into_future().fuse() => {
+            res?;
+
+            Err(anyhow::anyhow!("server stopped unexpected"))
+        }
+    }*/
 }
 
 async fn handle(State(mut handler): State<Handler>, headers: HeaderMap, req: Request) -> Response {
@@ -420,4 +438,16 @@ fn init_log(debug: bool) {
         .with(layer)
         .with(level)
         .init()
+}
+
+async fn signal_stop() {
+    let mut term = unix::signal(SignalKind::terminate()).unwrap();
+    let mut interrupt = unix::signal(SignalKind::interrupt()).unwrap();
+
+    select! {
+        _ = term.recv().fuse() => {}
+        _ = interrupt.recv().fuse() => {}
+    }
+
+    info!("graceful stop")
 }

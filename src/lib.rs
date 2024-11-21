@@ -91,8 +91,6 @@ impl Handler {
     async fn handle(&mut self, req: Request, headers: HeaderMap) -> anyhow::Result<Response> {
         let (mut parts, body) = req.into_parts();
 
-        debug!(?parts, "get parts");
-
         if !self.is_whitelist_path(&parts.uri) {
             let auth = match self.get_auth_header(&headers) {
                 Err(status_code) => {
@@ -280,9 +278,19 @@ impl Handler {
     }
 
     fn is_token_server_request(&self, auth: &str) -> bool {
-        auth.split_once(' ')
-            .map(|(auth_type, _)| auth_type.eq_ignore_ascii_case("bearer"))
-            .unwrap_or(false)
+        let (auth_type, auth) = match auth.split_once(' ') {
+            None => return false,
+            Some(auth) => auth,
+        };
+        if !auth_type.eq_ignore_ascii_case("bearer") {
+            return false;
+        }
+
+        if let Ok(jwt_header) = jsonwebtoken::decode_header(auth) {
+            debug!(?jwt_header, "get jwt header done");
+        }
+
+        true
     }
 
     fn uid_from_path(uri: &Uri) -> anyhow::Result<u64> {
